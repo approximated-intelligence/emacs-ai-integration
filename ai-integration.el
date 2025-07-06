@@ -1,10 +1,10 @@
 ;;; ai-integration.el --- AI Integration for Emacs -*- lexical-binding: t -*-
 
-;; Author: Your Name
-;; Version: 1.0
+;; Author: Christian Bahls
+;; Version: 0.1
 ;; Package-Requires: ((emacs "27.1") (request "0.3.2") (org "9.0"))
 ;; Keywords: ai, chat, openai, claude, gemini, ollama, tools
-;; URL: https://github.com/yourusername/ai-integration
+;; URL: https://github.com/approximated-intelligence/emacs-ai-integration
 
 ;;; Commentary:
 
@@ -24,7 +24,7 @@
 ;; - Integration with org-mode, magit, lsp-mode, projectile
 ;;
 ;; Quick Start:
-;; 1. Configure your API keys:
+;; 1. Configure your API keys (if you don't want to use the more secure ENV vars):
 ;;    (setq ai-openai-api-key "your-key-here")
 ;;    (setq ai-claude-api-key "your-key-here")
 ;;
