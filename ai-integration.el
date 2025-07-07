@@ -593,8 +593,7 @@
          (buffer-name (format " *%s*" process-name))
          (temp-file (make-temp-file "ai-request-" nil ".json"))
          (response-buffer "")
-         (headers-processed nil)
-         (process-lines-seen (make-hash-table :test 'equal)))
+         (headers-processed nil))
     (ai-debug "CURL: %s: Starting curl process (%s)" provider-name (if streaming "streaming" "non-streaming"))
     (with-temp-file temp-file
       (insert data))
@@ -608,6 +607,12 @@
                               (list "-X" "POST"
                                     "-d" (format "@%s" temp-file)
                                     url))))
+      (ai-debug "CURL: %S" curl-args)
+      (ai-debug "HEADER: %S" header-args)
+      (ai-debug "TEMP FILE: %S" temp-file)
+      (with-temp-buffer
+	(insert-file-contents temp-file)
+	(ai-debug (buffer-string)))
       (let ((process (apply #'start-process process-name buffer-name curl-args)))
         (setf (ai-stream-context-request-object stream-context) process)
         (set-process-filter
@@ -621,13 +626,10 @@
            (when headers-processed
              (if streaming
                  ;; Streaming: process line by line
-                 (while (string-match "\\(.*?\n\\)" response-buffer)
-                   (let ((line (match-string 1 response-buffer)))
-                     (setq response-buffer (substring response-buffer (match-end 0)))
-                     (let ((line-hash (secure-hash 'md5 line)))
-                       (unless (gethash line-hash process-lines-seen)
-                         (puthash line-hash t process-lines-seen)
-                         (ai-process-response line stream-context provider-name t)))))
+		 (while (string-match "\\(.*?\n\\)" response-buffer)
+		   (let ((line (match-string 1 response-buffer)))
+		     (setq response-buffer (substring response-buffer (match-end 0)))
+		     (ai-process-response line stream-context provider-name t)))
                ;; Non-streaming: accumulate all response
                (setf (ai-stream-context-accumulated-text stream-context) response-buffer)))))
         (set-process-sentinel
@@ -735,8 +737,8 @@
                 (if error-msg
                     (ai-handle-request-error error-msg stream-context)
                   (ai-extract-and-stream-content data stream-context provider-name)))
-            (error
-             (ai-debug "JSON parsing error: %s" err))))))))
+	    (error
+	     (ai-debug "JSON parsing error: %s" err))))))))
 
 (defun ai-handle-request-error (error stream-context)
   "Handle request ERROR."
