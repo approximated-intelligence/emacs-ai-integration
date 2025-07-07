@@ -297,9 +297,10 @@
 (defun ai-generate-buffer-name (&optional provider source-buffer force-new)
   "Generate appropriate buffer name for AI session."
   (let* ((provider (or provider ai-default-provider))
-         (base-name (if source-buffer
-                        (format "*AI Chat (%s) - %s*" provider (buffer-name source-buffer))
-                      (format "*AI Chat (%s)*" provider))))
+         (source-name (if source-buffer
+                         (buffer-name source-buffer)
+                       "*"))
+         (base-name (format "%s AI %s" source-name provider)))
     (if force-new
         (generate-new-buffer-name base-name)
       base-name)))
@@ -567,67 +568,118 @@
   (let* ((provider (ai-get-provider provider-name))
          (endpoint (ai-get-provider-endpoint provider-name))
          (headers (funcall (ai-provider-headers-fn provider) model messages))
-         (data (funcall (ai-provider-data-fn provider) model messages streaming)))
-    (unless provider
-      (error "Unknown provider: %s" provider-name))
-    (when (string= provider-name "gemini")
-      (let ((api-key (ai-get-provider-api-key "gemini")))
-        (setq endpoint (concat endpoint "?key=" api-key))))
-    (if streaming
-        (ai-make-streaming-request provider-name endpoint headers data)
-      (ai-make-non-streaming-request provider-name endpoint headers data))))
-
-(defun ai-make-non-streaming-request (provider-name endpoint headers data)
-  "Make non-streaming request to ENDPOINT."
-  (let* ((provider (ai-get-provider provider-name))
-         (target-buffer (current-buffer))  ; Capture current buffer
-         (response-marker (with-current-buffer target-buffer (point-max-marker))))
-    (with-current-buffer target-buffer (ai-set-status 'requesting))
-    (request
-     endpoint
-     :type "POST"
-     :headers headers
-     :data data
-     :parser 'json-read
-     :timeout ai-request-timeout
-     :success (cl-function
-               (lambda (&key data &allow-other-keys)
-                 (with-current-buffer target-buffer  ; Ensure correct buffer
-                   (let ((error-msg (when (ai-provider-error-parser provider)
-                                      (funcall (ai-provider-error-parser provider) data))))
-                     (if error-msg
-                         (progn (ai-set-status 'error)
-                                (message error-msg))
-                       (let ((response (funcall (ai-provider-response-parser provider) data)))
-                         (save-excursion
-                           (goto-char response-marker)
-                           (insert response))
-                         (ai-add-message response "assistant")
-                         (ai-highlight-code-blocks response-marker (point-max))
-                         (ai-insert-prompt)
-                         (goto-char (point-max))))  ; Position at prompt
-                     (ai-clear-status)))))
-     :error (cl-function
-             (lambda (&key error-thrown &allow-other-keys)
-               (with-current-buffer target-buffer
-                 (ai-set-status 'error)
-                 (message "AI request error: %s" error-thrown)
-                 (ai-clear-status)))))))
-
-(defun ai-make-streaming-request (provider-name endpoint headers data)
-  "Make streaming request to ENDPOINT."
-  (let* ((target-buffer (current-buffer))
+         (data (funcall (ai-provider-data-fn provider) model messages streaming))
+         (target-buffer (current-buffer))
          (response-marker (with-current-buffer target-buffer (point-max-marker)))
          (stream-context (make-ai-stream-context
                           :buffer target-buffer
                           :response-marker response-marker
                           :accumulated-text ""
                           :request-object nil)))
+    (unless provider
+      (error "Unknown provider: %s" provider-name))
+    (when (string= provider-name "gemini")
+      (let ((api-key (ai-get-provider-api-key "gemini")))
+        (setq endpoint (concat endpoint "?key=" api-key))))
     (with-current-buffer target-buffer
       (setq ai-current-stream stream-context)
       (ai-set-status 'requesting))
-    (ai-make-curl-streaming-request
-     provider-name endpoint headers data stream-context)))
+    (ai-make-curl-request provider-name endpoint headers data stream-context streaming)))
+
+(defun ai-make-curl-request (provider-name url headers data stream-context streaming)
+  "Make HTTP request using curl process."
+  (let* ((target-buffer (ai-stream-context-buffer stream-context))
+         (process-name (format "ai-request-%s" (buffer-name target-buffer)))
+         (buffer-name (format " *%s*" process-name))
+         (temp-file (make-temp-file "ai-request-" nil ".json"))
+         (response-buffer "")
+         (headers-processed nil)
+         (process-lines-seen (make-hash-table :test 'equal)))
+    (ai-debug "CURL: %s: Starting curl process (%s)" provider-name (if streaming "streaming" "non-streaming"))
+    (with-temp-file temp-file
+      (insert data))
+    (let* ((header-args (mapcar (lambda (h) (list "-H" (format "%s: %s" (car h) (cdr h)))) headers))
+           (curl-args (append '("curl" "-s" "--show-error")
+                              (when streaming '("-N" "--no-buffer"))
+                              (list "--max-time" (number-to-string ai-request-timeout)
+                                    ;; Add this flag to include response headers
+                                    "-i")
+                              (apply #'append header-args)
+                              (list "-X" "POST"
+                                    "-d" (format "@%s" temp-file)
+                                    url))))
+      (let ((process (apply #'start-process process-name buffer-name curl-args)))
+        (setf (ai-stream-context-request-object stream-context) process)
+        (set-process-filter
+         process
+         (lambda (proc output)
+           (setq response-buffer (concat response-buffer output))
+           (unless headers-processed
+             (when (string-match "\r?\n\r?\n" response-buffer)
+               (setq response-buffer (substring response-buffer (match-end 0)))
+               (setq headers-processed t)))
+           (when headers-processed
+             (if streaming
+                 ;; Streaming: process line by line
+                 (while (string-match "\\(.*?\n\\)" response-buffer)
+                   (let ((line (match-string 1 response-buffer)))
+                     (setq response-buffer (substring response-buffer (match-end 0)))
+                     (let ((line-hash (secure-hash 'md5 line)))
+                       (unless (gethash line-hash process-lines-seen)
+                         (puthash line-hash t process-lines-seen)
+                         (ai-process-response line stream-context provider-name t)))))
+               ;; Non-streaming: accumulate all response
+               (setf (ai-stream-context-accumulated-text stream-context) response-buffer)))))
+        (set-process-sentinel
+         process
+         (lambda (proc event)
+           (when (file-exists-p temp-file)
+             (delete-file temp-file))
+           (when (buffer-live-p (process-buffer proc))
+             (kill-buffer (process-buffer proc)))
+           (let ((exit-code (process-exit-status proc))
+                 (exit-signal (process-status proc)))
+             (cond
+              ((zerop exit-code)
+               (when (not streaming)
+                 ;; Process the complete response
+                 (let ((response-data (ai-stream-context-accumulated-text stream-context)))
+                   (ai-debug "Non-streaming response data: %s" (substring response-data 0 (min 200 (length response-data))))
+                   (ai-process-response response-data stream-context provider-name nil)))
+               (ai-finalize-response stream-context))
+              ((memq exit-signal '(signal interrupt))
+               (ai-handle-request-cancellation stream-context))
+              (t
+               (let ((error-msg (ai-get-curl-error-message proc exit-code)))
+                 (ai-handle-request-error error-msg stream-context)))))))
+        process))))
+
+(defun ai-process-response (response-data stream-context provider-name is-streaming)
+  "Process response data (streaming chunk or bulk response)."
+  (if is-streaming
+      ;; Streaming: process as SSE line
+      (ai-process-stream-line response-data stream-context provider-name)
+    ;; Non-streaming: parse JSON and stream the complete response
+    (condition-case err
+        (let* ((provider (ai-get-provider provider-name))
+               ;; Clean up the response data before parsing
+               (cleaned-data (string-trim response-data))
+               (json-data (progn
+                            (ai-debug "Parsing JSON data: %s" (substring cleaned-data 0 (min 500 (length cleaned-data))))
+                            (json-read-from-string cleaned-data)))
+               (error-msg (when (ai-provider-error-parser provider)
+                            (funcall (ai-provider-error-parser provider) json-data))))
+          (if error-msg
+              (ai-handle-request-error error-msg stream-context)
+            (let ((response (funcall (ai-provider-response-parser provider) json-data)))
+              (ai-debug "Extracted response: %s" (substring response 0 (min 100 (length response))))
+              (ai-stream-chunk response stream-context))))
+      (error
+       (ai-debug "JSON parsing failed. Raw data: %s" response-data)
+       (ai-handle-request-error (format "JSON parsing error: %s\nRaw response: %s" 
+                                        (error-message-string err) 
+                                        (substring response-data 0 (min 200 (length response-data)))) 
+                                stream-context)))))
 
 (defun ai-stream-chunk (content stream-context)
   "Stream CONTENT chunk to buffer."
@@ -644,11 +696,14 @@
             (goto-char marker)
             (insert content)
             (set-marker marker (point)))
-          (ai-update-streaming-progress (length (ai-stream-context-accumulated-text stream-context)))
+          ;; Handle progress updates based on streaming mode
+          (if ai-streaming-enabled
+              (ai-update-mode-line (length (ai-stream-context-accumulated-text stream-context)))
+            (ai-update-mode-line))
           (redisplay t))))))
 
-(defun ai-finalize-stream (stream-context)
-  "Finalize streaming response."
+(defun ai-finalize-response (stream-context)
+  "Finalize response (always the same regardless of streaming mode)."
   (when (and stream-context (ai-stream-context-buffer stream-context))
     (let ((buffer (ai-stream-context-buffer stream-context))
           (accumulated-text (ai-stream-context-accumulated-text stream-context))
@@ -682,62 +737,6 @@
                   (ai-extract-and-stream-content data stream-context provider-name)))
             (error
              (ai-debug "JSON parsing error: %s" err))))))))
-
-(defun ai-make-curl-streaming-request (provider-name url headers data stream-context)
-  "Make streaming HTTP request using curl process."
-  (let* ((target-buffer (ai-stream-context-buffer stream-context))
-         (process-name (format "ai-stream-%s" (buffer-name target-buffer)))
-         (buffer-name (format " *%s*" process-name))
-         (temp-file (make-temp-file "ai-request-" nil ".json"))
-         (response-buffer "")
-         (headers-processed nil)
-         (process-lines-seen (make-hash-table :test 'equal)))
-    (ai-debug "CURL: %s: Starting curl process for streaming" provider-name)
-    (with-temp-file temp-file
-      (insert data))
-    (let* ((header-args (mapcar (lambda (h) (list "-H" (format "%s: %s" (car h) (cdr h)))) headers))
-           (curl-args (append '("curl" "-s" "-N" "--no-buffer" "--show-error")
-                              (list "--max-time" (number-to-string ai-request-timeout))
-                              (apply #'append header-args)
-                              (list "-X" "POST"
-                                    "-d" (format "@%s" temp-file)
-                                    url))))
-      (let ((process (apply #'start-process process-name buffer-name curl-args)))
-        (setf (ai-stream-context-request-object stream-context) process)
-        (set-process-filter
-         process
-         (lambda (proc output)
-           (setq response-buffer (concat response-buffer output))
-           (unless headers-processed
-             (when (string-match "\r?\n\r?\n" response-buffer)
-               (setq response-buffer (substring response-buffer (match-end 0)))
-               (setq headers-processed t)))
-           (when headers-processed
-             (while (string-match "\\(.*?\n\\)" response-buffer)
-               (let ((line (match-string 1 response-buffer)))
-                 (setq response-buffer (substring response-buffer (match-end 0)))
-                 (let ((line-hash (secure-hash 'md5 line)))
-                   (unless (gethash line-hash process-lines-seen)
-                     (puthash line-hash t process-lines-seen)
-                     (ai-process-stream-line line stream-context provider-name))))))))
-        (set-process-sentinel
-         process
-         (lambda (proc event)
-           (when (file-exists-p temp-file)
-             (delete-file temp-file))
-           (when (buffer-live-p (process-buffer proc))
-             (kill-buffer (process-buffer proc)))
-           (let ((exit-code (process-exit-status proc))
-                 (exit-signal (process-status proc)))
-             (cond
-              ((zerop exit-code)
-               (ai-finalize-stream stream-context))
-              ((memq exit-signal '(signal interrupt))
-               (ai-handle-request-cancellation stream-context))
-              (t
-               (let ((error-msg (ai-get-curl-error-message proc exit-code)))
-                 (ai-handle-request-error error-msg stream-context)))))))
-        process))))
 
 (defun ai-handle-request-error (error stream-context)
   "Handle request ERROR."
@@ -789,24 +788,6 @@
                              (with-current-buffer buffer
                                (ai-clear-status)))))))))
   (message "Request cancelled"))
-
-(defun ai-update-streaming-progress (char-count)
-  "Update mode line with streaming progress."
-  (let ((progress-indicator (cond
-                             ((< char-count 100) "▏")
-                             ((< char-count 500) "▎")
-                             ((< char-count 1000) "▍")
-                             ((< char-count 2000) "▌")
-                             ((< char-count 5000) "▋")
-                             (t "▊"))))
-    (setq mode-line-buffer-identification
-          (list (propertize
-                 (format "AI Chat (%s) %s %d chars"
-                         (ai-session-provider ai-current-session)
-                         progress-indicator
-                         char-count)
-                 'face 'mode-line-buffer-id)))
-    (force-mode-line-update)))
 
 (defun ai-get-curl-error-message (process exit-code)
   "Get meaningful error message from curl process."
@@ -1059,24 +1040,38 @@ If FORCE-NEW is non-nil, always create new session."
   (ai-update-mode-line)
   (force-mode-line-update))
 
-(defun ai-update-mode-line ()
+(defun ai-update-mode-line (&optional chunk-count)
   "Update mode line with current status."
   (when ai-current-session
-    (let ((status-text (cdr (assoc ai-current-status ai-status-indicators))))
-      (unless (eq ai-current-status 'streaming)  ; Streaming handled separately
-        (setq mode-line-buffer-identification
-              (list (propertize
-                     (format "AI Chat (%s)%s"
-                             (ai-session-provider ai-current-session)
-                             (or status-text ""))
-                     'face (cond
-                            ((eq ai-current-status 'error) 'error)
-                            ((eq ai-current-status 'streaming) 'success)
-                            ((eq ai-current-status 'requesting) 'warning)
-                            ((eq ai-current-status 'cancelling) 'warning)
-                            ((eq ai-current-status 'cancelled) 'shadow)
-                            (t 'mode-line-buffer-id)))))
-        (force-mode-line-update)))))
+    (let* ((status-text (cdr (assoc ai-current-status ai-status-indicators)))
+           (provider (ai-session-provider ai-current-session))
+           (source-buffer (ai-session-source-buffer ai-current-session))
+           (source-name (if source-buffer 
+                           (buffer-name source-buffer) 
+                         "*"))
+           (buffer-display-name (format "%s AI %s" source-name provider)))
+      (setq mode-line-buffer-identification
+            (list (propertize
+                   (if (and chunk-count (eq ai-current-status 'streaming))
+                       (let ((progress-indicator (cond
+						  ((< chunk-count 32) "▏")
+						  ((< chunk-count 64) "▎")
+						  ((< chunk-count 128) "▍")
+						  ((< chunk-count 256) "▌")
+						  ((< chunk-count 512) "▋")
+						  ((< chunk-count 1024) "▊")
+						  ((< chunk-count 2048) "▉")
+						  (t "█"))))
+                         (format "%s %s %d chunks" buffer-display-name progress-indicator chunk-count))
+                     (format "%s%s" buffer-display-name (or status-text "")))
+                   'face (cond
+                          ((eq ai-current-status 'error) 'error)
+                          ((eq ai-current-status 'streaming) 'success)
+                          ((eq ai-current-status 'requesting) 'warning)
+                          ((eq ai-current-status 'cancelling) 'warning)
+                          ((eq ai-current-status 'cancelled) 'shadow)
+                          (t 'mode-line-buffer-id)))))
+      (force-mode-line-update))))
 
 (defun ai-clear-status ()
   "Clear current status."
