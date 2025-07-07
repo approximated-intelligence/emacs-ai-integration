@@ -1,10 +1,9 @@
 # Emacs AI Integration
 <img src="https://repository-images.githubusercontent.com/1014713653/0036f9c7-20ac-4647-96c8-2cdecd49221a" style="width:100%; height:auth;">
-----
-
-A comprehensive AI assistant for Emacs with support for multiple providers (OpenAI, Claude, Gemini, Ollama, llama.cpp) and extensive features for code analysis, text editing, and project management.
 
 ## Features
+
+A comprehensive AI assistant for Emacs with support for multiple providers (OpenAI, Claude, Gemini, Ollama, llama.cpp) and extensive features for code analysis, text editing, and project management.
 
 - **Multi-provider support**: OpenAI, Claude, Gemini, Ollama, llama.cpp
 - **Streaming and non-streaming responses**
