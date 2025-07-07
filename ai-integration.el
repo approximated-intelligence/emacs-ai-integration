@@ -1,13 +1,10 @@
 ;;; ai-integration.el --- AI Integration for Emacs -*- lexical-binding: t -*-
-
 ;; Author: Christian Bahls
 ;; Version: 0.1
-;; Package-Requires: ((emacs "27.1") (request "0.3.2") (org "9.0"))
+;; Package-Requires: ((emacs "27.1") (org "9.0"))
 ;; Keywords: ai, chat, openai, claude, gemini, ollama, tools
 ;; URL: https://github.com/approximated-intelligence/emacs-ai-integration
-
 ;;; Commentary:
-
 ;; AI Integration provides comprehensive AI assistance in Emacs with support for
 ;; multiple providers (OpenAI, Claude, Gemini, Ollama, llama.cpp) and extensive
 ;; features for code analysis, text editing, and project management.
@@ -37,19 +34,18 @@
 ;; Main Keybindings:
 ;; - C-c a RET    : Start AI chat
 ;; - C-c a c      : Code commands prefix
-;; - C-c a t      : Text commands prefix  
+;; - C-c a t      : Text commands prefix
 ;; - C-c a s      : Send commands prefix
 ;; - C-c a x      : Context commands prefix
 ;; - C-c a q      : Quick actions
 ;;
 ;; See README for complete documentation.
-
 ;;; Code:
 
-
 (require 'org)
-(require 'request)
+
 (require 'json)
+
 (require 'cl-lib)
 
 (defgroup ai-integration nil
@@ -254,7 +250,8 @@
   headers-fn          ; Function to generate headers
   data-fn             ; Function to generate request data
   response-parser     ; Function to parse response
-  stream-parser)      ; Function to parse streaming data
+  stream-parser       ; Function to parse streaming data
+  error-parser)        ; Function to parse errors from provider
 
 (defvar ai-providers (make-hash-table :test 'equal)
   "Registry of AI provider plugins.")
@@ -286,53 +283,26 @@
 (defvar-local ai-associated-sessions nil
   "List of AI sessions associated with this buffer.")
 
-;; (defun ai-associate-buffer-with-session (buffer session)
-;;   "Associate BUFFER with SESSION."
-;;   (with-current-buffer buffer
-;;     (unless (memq session ai-associated-sessions)
-;;       (push session ai-associated-sessions)))
-;;   (puthash buffer session ai-buffer-last-session-map)
-;;   (unless (member buffer (ai-session-associated-buffers session))
-;;     (push buffer (ai-session-associated-buffers session))))
-
-;; (defun ai-get-buffer-sessions (buffer)
-;;   "Get all sessions associated with BUFFER."
-;;   (with-current-buffer buffer
-;;     (cl-remove-if-not (lambda (session)
-;;                         (buffer-live-p (ai-session-buffer session)))
-;;                       ai-associated-sessions)))
+(defun ai-associate-buffer-with-session (buffer session)
+  "Associate BUFFER with SESSION."
+  (when (and buffer session)
+    (puthash buffer session ai-buffer-last-session-map)
+    (unless (member buffer (ai-session-associated-buffers session))
+      (setf (ai-session-associated-buffers session)
+            (cons buffer (ai-session-associated-buffers session))))))
 
 (defvar ai-session-buffer-counters (make-hash-table :test 'equal)
   "Hash table to track buffer name counters for each source buffer.")
 
-(defun ai-generate-session-buffer-name (source-buffer)
-  "Generate unique buffer name for SOURCE-BUFFER with enumeration."
-  (let* ((base-name (buffer-name source-buffer))
-         (key (format "%s" base-name))
-         (current-count (gethash key ai-session-buffer-counters 0))
-         (new-count (1+ current-count)))
-    (puthash key new-count ai-session-buffer-counters)
-    (when (= new-count 2)
-      (ai-rename-first-session-buffer base-name))
-    (if (= new-count 1)
-        (format "*AI Chat - %s*" base-name)
-      (format "*AI Chat - %s <%d>*" base-name new-count))))
-
-(defun ai-rename-first-session-buffer (base-name)
-  "Rename the first session buffer to include <1> suffix."
-  (let ((first-buffer-name (format "*AI Chat - %s*" base-name))
-        (new-first-buffer-name (format "*AI Chat - %s <1>*" base-name)))
-    (when-let ((first-buffer (get-buffer first-buffer-name)))
-      (with-current-buffer first-buffer
-        (rename-buffer new-first-buffer-name)))))
-
-(defun ai-cleanup-session-counter (source-buffer-name)
-  "Clean up counter when session is closed."
-  (let* ((key (format "%s" source-buffer-name))
-         (current-count (gethash key ai-session-buffer-counters 0)))
-    (if (<= current-count 1)
-        (remhash key ai-session-buffer-counters)
-      (puthash key (1- current-count) ai-session-buffer-counters))))
+(defun ai-generate-buffer-name (&optional provider source-buffer force-new)
+  "Generate appropriate buffer name for AI session."
+  (let* ((provider (or provider ai-default-provider))
+         (base-name (if source-buffer
+                        (format "*AI Chat (%s) - %s*" provider (buffer-name source-buffer))
+                      (format "*AI Chat (%s)*" provider))))
+    (if force-new
+        (generate-new-buffer-name base-name)
+      base-name)))
 
 (defun ai-register-provider (name provider)
   "Register PROVIDER under NAME."
@@ -400,6 +370,11 @@
         (ai-debug "OpenAI returning content: %s" content)
         content))))
 
+(defun ai-openai-error-parser (data)
+  "Parse OpenAI error response."
+  (when-let ((error (cdr (assoc 'error data))))
+    (format "OpenAI Error: %s" (cdr (assoc 'message error)))))
+
 (defun ai-openai-headers-fn (model messages)
   "Generate headers for OpenAI API."
   (let ((api-key (ai-get-provider-api-key "openai")))
@@ -435,6 +410,11 @@
           (ai-debug "Claude returning content: %s" content)
           content)))))
 
+(defun ai-claude-error-parser (data)
+  "Parse Claude error response."
+  (when-let ((error (cdr (assoc 'error data))))
+    (format "Claude Error: %s" (cdr (assoc 'message error)))))
+
 (defun ai-claude-headers-fn (model messages)
   "Generate headers for Claude API."
   (let ((api-key (ai-get-provider-api-key "claude")))
@@ -463,6 +443,11 @@
     (when message
       (cdr (assoc 'content message)))))
 
+(defun ai-ollama-error-parser (data)
+  "Parse Ollama error response."
+  (when-let ((error (cdr (assoc 'error data))))
+    (format "Ollama Error: %s" error)))
+
 (defun ai-ollama-headers-fn (model messages)
   "Generate headers for Ollama (no authentication)."
   '(("Content-Type" . "application/json")))
@@ -488,6 +473,11 @@
 (defun ai-gemini-stream-parser (json-data)
   "Parse Gemini streaming chunk."
   nil)
+
+(defun ai-gemini-error-parser (data)
+  "Parse Gemini error response."
+  (when-let ((error (cdr (assoc 'error data))))
+    (format "Gemini Error: %s" (cdr (assoc 'message error)))))
 
 (defun ai-gemini-headers-fn (model messages)
   "Generate headers for Gemini API."
@@ -521,7 +511,8 @@
    :headers-fn #'ai-openai-headers-fn
    :data-fn #'ai-openai-data-fn
    :response-parser #'ai-openai-response-parser
-   :stream-parser #'ai-openai-stream-parser))
+   :stream-parser #'ai-openai-stream-parser
+   :error-parser #'ai-openai-error-parser))
 
 (ai-register-provider "claude"
   (make-ai-provider
@@ -532,7 +523,8 @@
    :headers-fn #'ai-claude-headers-fn
    :data-fn #'ai-claude-data-fn
    :response-parser #'ai-claude-response-parser
-   :stream-parser #'ai-claude-stream-parser))
+   :stream-parser #'ai-claude-stream-parser
+   :error-parser #'ai-claude-error-parser))
 
 (ai-register-provider "ollama"
   (make-ai-provider
@@ -543,7 +535,8 @@
    :headers-fn #'ai-ollama-headers-fn
    :data-fn #'ai-ollama-data-fn
    :response-parser #'ai-ollama-response-parser
-   :stream-parser #'ai-ollama-stream-parser))
+   :stream-parser #'ai-ollama-stream-parser
+   :error-parser #'ai-ollama-error-parser))
 
 (ai-register-provider "llama-cpp"
   (make-ai-provider
@@ -554,7 +547,8 @@
    :headers-fn #'ai-local-headers-fn
    :data-fn #'ai-openai-data-fn        ; OpenAI-compatible
    :response-parser #'ai-openai-response-parser
-   :stream-parser #'ai-openai-stream-parser))
+   :stream-parser #'ai-openai-stream-parser
+   :error-parser #'ai-openai-error-parser))
 
 (ai-register-provider "gemini"
   (make-ai-provider
@@ -565,7 +559,8 @@
    :headers-fn #'ai-gemini-headers-fn
    :data-fn #'ai-gemini-data-fn
    :response-parser #'ai-gemini-response-parser
-   :stream-parser #'ai-gemini-stream-parser))
+   :stream-parser #'ai-gemini-stream-parser
+   :error-parser #'ai-gemini-error-parser))
 
 (defun ai-make-unified-request (provider-name model messages streaming)
   "Make unified request to PROVIDER-NAME with MODEL and MESSAGES."
@@ -582,27 +577,12 @@
         (ai-make-streaming-request provider-name endpoint headers data)
       (ai-make-non-streaming-request provider-name endpoint headers data))))
 
-(defun ai-make-streaming-request (provider-name endpoint headers data)
-  "Make streaming request to ENDPOINT."
-  (ai-debug "REQUEST: Starting streaming for: %s" provider-name)
-  (let* ((response-marker (point-max-marker)) ; Use existing position, don't prepare again
-         (stream-context (make-ai-stream-context
-                          :buffer (current-buffer)
-                          :response-marker response-marker
-                          :accumulated-text ""
-                          :request-object nil)))
-    (setq ai-current-stream stream-context)
-    (ai-set-status 'requesting)
-    (ai-make-curl-streaming-request
-     provider-name endpoint headers data stream-context
-     (lambda (response)
-       (ai-finish-stream response stream-context)))))
-
 (defun ai-make-non-streaming-request (provider-name endpoint headers data)
   "Make non-streaming request to ENDPOINT."
   (let* ((provider (ai-get-provider provider-name))
-         (response-marker (point-max-marker)))
-    (ai-set-status 'requesting)
+         (target-buffer (current-buffer))  ; Capture current buffer
+         (response-marker (with-current-buffer target-buffer (point-max-marker))))
+    (with-current-buffer target-buffer (ai-set-status 'requesting))
     (request
      endpoint
      :type "POST"
@@ -612,20 +592,203 @@
      :timeout ai-request-timeout
      :success (cl-function
                (lambda (&key data &allow-other-keys)
-                 (let ((response (funcall (ai-provider-response-parser provider) data)))
-                   (save-excursion
-                     (goto-char response-marker)
-                     (insert response))
-                   (ai-add-message response "assistant")
-                   (goto-char (point-max))
-                   (ai-highlight-code-blocks response-marker (point))
-		   (ai-insert-prompt)
-                   (ai-clear-status))))
+                 (with-current-buffer target-buffer  ; Ensure correct buffer
+                   (let ((error-msg (when (ai-provider-error-parser provider)
+                                      (funcall (ai-provider-error-parser provider) data))))
+                     (if error-msg
+                         (progn (ai-set-status 'error)
+                                (message error-msg))
+                       (let ((response (funcall (ai-provider-response-parser provider) data)))
+                         (save-excursion
+                           (goto-char response-marker)
+                           (insert response))
+                         (ai-add-message response "assistant")
+                         (ai-highlight-code-blocks response-marker (point-max))
+                         (ai-insert-prompt)
+                         (goto-char (point-max))))  ; Position at prompt
+                     (ai-clear-status)))))
      :error (cl-function
              (lambda (&key error-thrown &allow-other-keys)
-               (ai-set-status 'error)
-               (message "AI request error: %s" error-thrown)
-               (ai-clear-status))))))
+               (with-current-buffer target-buffer
+                 (ai-set-status 'error)
+                 (message "AI request error: %s" error-thrown)
+                 (ai-clear-status)))))))
+
+(defun ai-make-streaming-request (provider-name endpoint headers data)
+  "Make streaming request to ENDPOINT."
+  (let* ((target-buffer (current-buffer))
+         (response-marker (with-current-buffer target-buffer (point-max-marker)))
+         (stream-context (make-ai-stream-context
+                          :buffer target-buffer
+                          :response-marker response-marker
+                          :accumulated-text ""
+                          :request-object nil)))
+    (with-current-buffer target-buffer
+      (setq ai-current-stream stream-context)
+      (ai-set-status 'requesting))
+    (ai-make-curl-streaming-request
+     provider-name endpoint headers data stream-context)))
+
+(defun ai-stream-chunk (content stream-context)
+  "Stream CONTENT chunk to buffer."
+  (when (and content (not (string-empty-p content)) stream-context)
+    (let ((buffer (ai-stream-context-buffer stream-context))
+          (marker (ai-stream-context-response-marker stream-context)))
+      (when (and buffer (buffer-live-p buffer) marker)
+        (with-current-buffer buffer
+          (when (string-empty-p (ai-stream-context-accumulated-text stream-context))
+            (ai-set-status 'streaming))
+          (setf (ai-stream-context-accumulated-text stream-context)
+                (concat (ai-stream-context-accumulated-text stream-context) content))
+          (save-excursion
+            (goto-char marker)
+            (insert content)
+            (set-marker marker (point)))
+          (ai-update-streaming-progress (length (ai-stream-context-accumulated-text stream-context)))
+          (redisplay t))))))
+
+(defun ai-finalize-stream (stream-context)
+  "Finalize streaming response."
+  (when (and stream-context (ai-stream-context-buffer stream-context))
+    (let ((buffer (ai-stream-context-buffer stream-context))
+          (accumulated-text (ai-stream-context-accumulated-text stream-context))
+          (response-marker (ai-stream-context-response-marker stream-context)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq ai-current-stream nil)
+          (when (and accumulated-text (not (string-empty-p accumulated-text)))
+            (ai-add-message accumulated-text "assistant")
+            (ai-highlight-code-blocks response-marker (point-max))
+            (ai-insert-prompt)
+            (goto-char (point-max)))
+          (ai-clear-status)
+          (message "Response complete"))))))
+
+(defun ai-process-stream-line (line stream-context provider-name)
+  "Process a single line from the streaming response."
+  (let ((line (string-trim line)))
+    (when (and (not (string-empty-p line))
+               (not (string-prefix-p "event:" line))
+               (string-prefix-p "data:" line))
+      (let ((data-str (string-trim (substring line 5))))
+        (when (not (string-empty-p data-str))
+          (condition-case err
+              (let* ((data (json-read-from-string data-str))
+                     (provider (ai-get-provider provider-name))
+                     (error-msg (when (ai-provider-error-parser provider)
+                                  (funcall (ai-provider-error-parser provider) data))))
+                (if error-msg
+                    (ai-handle-request-error error-msg stream-context)
+                  (ai-extract-and-stream-content data stream-context provider-name)))
+            (error
+             (ai-debug "JSON parsing error: %s" err))))))))
+
+(defun ai-make-curl-streaming-request (provider-name url headers data stream-context)
+  "Make streaming HTTP request using curl process."
+  (let* ((target-buffer (ai-stream-context-buffer stream-context))
+         (process-name (format "ai-stream-%s" (buffer-name target-buffer)))
+         (buffer-name (format " *%s*" process-name))
+         (temp-file (make-temp-file "ai-request-" nil ".json"))
+         (response-buffer "")
+         (headers-processed nil)
+         (process-lines-seen (make-hash-table :test 'equal)))
+    (ai-debug "CURL: %s: Starting curl process for streaming" provider-name)
+    (with-temp-file temp-file
+      (insert data))
+    (let* ((header-args (mapcar (lambda (h) (list "-H" (format "%s: %s" (car h) (cdr h)))) headers))
+           (curl-args (append '("curl" "-s" "-N" "--no-buffer" "--show-error")
+                              (list "--max-time" (number-to-string ai-request-timeout))
+                              (apply #'append header-args)
+                              (list "-X" "POST"
+                                    "-d" (format "@%s" temp-file)
+                                    url))))
+      (let ((process (apply #'start-process process-name buffer-name curl-args)))
+        (setf (ai-stream-context-request-object stream-context) process)
+        (set-process-filter
+         process
+         (lambda (proc output)
+           (setq response-buffer (concat response-buffer output))
+           (unless headers-processed
+             (when (string-match "\r?\n\r?\n" response-buffer)
+               (setq response-buffer (substring response-buffer (match-end 0)))
+               (setq headers-processed t)))
+           (when headers-processed
+             (while (string-match "\\(.*?\n\\)" response-buffer)
+               (let ((line (match-string 1 response-buffer)))
+                 (setq response-buffer (substring response-buffer (match-end 0)))
+                 (let ((line-hash (secure-hash 'md5 line)))
+                   (unless (gethash line-hash process-lines-seen)
+                     (puthash line-hash t process-lines-seen)
+                     (ai-process-stream-line line stream-context provider-name))))))))
+        (set-process-sentinel
+         process
+         (lambda (proc event)
+           (when (file-exists-p temp-file)
+             (delete-file temp-file))
+           (when (buffer-live-p (process-buffer proc))
+             (kill-buffer (process-buffer proc)))
+           (let ((exit-code (process-exit-status proc))
+                 (exit-signal (process-status proc)))
+             (cond
+              ((zerop exit-code)
+               (ai-finalize-stream stream-context))
+              ((memq exit-signal '(signal interrupt))
+               (ai-handle-request-cancellation stream-context))
+              (t
+               (let ((error-msg (ai-get-curl-error-message proc exit-code)))
+                 (ai-handle-request-error error-msg stream-context)))))))
+        process))))
+
+(defun ai-handle-request-error (error stream-context)
+  "Handle request ERROR."
+  (when (and stream-context (ai-stream-context-buffer stream-context))
+    (let ((buffer (ai-stream-context-buffer stream-context)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq ai-current-stream nil)
+          (ai-set-status 'error)
+          (message "AI Chat Error: %s" error)
+          (run-with-timer 3.0 nil
+                         (lambda ()
+                           (when (buffer-live-p buffer)
+                             (with-current-buffer buffer
+                               (ai-clear-status))))))))))
+
+(defun ai-handle-request-cancellation (stream-context)
+  "Handle request cancellation."
+  (when (and stream-context (ai-stream-context-buffer stream-context))
+    (let ((buffer (ai-stream-context-buffer stream-context)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq ai-current-stream nil)
+          (ai-set-status 'cancelled)
+          (run-with-timer 2.0 nil
+                         (lambda ()
+                           (when (buffer-live-p buffer)
+                             (with-current-buffer buffer
+                               (ai-clear-status)))))
+          (message "Request cancelled"))))))
+
+(defun ai-cleanup-cancelled-request ()
+  "Clean up after request cancellation."
+  (when (and ai-current-stream (ai-stream-context-buffer ai-current-stream))
+    (let ((buffer (ai-stream-context-buffer ai-current-stream)))
+      (setq ai-current-stream nil)
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (ai-set-status 'cancelled)
+          (save-excursion
+            (goto-char (point-max))
+            (when (re-search-backward "^\\*\\* Assistant Response" nil t)
+              (let ((response-start (progn (forward-line 1) (point))))
+                (when (string-empty-p (string-trim (buffer-substring response-start (point-max))))
+                  (delete-region (line-beginning-position 0) (point-max))))))
+          (run-with-timer 1.0 nil
+                         (lambda ()
+                           (when (buffer-live-p buffer)
+                             (with-current-buffer buffer
+                               (ai-clear-status)))))))))
+  (message "Request cancelled"))
 
 (defun ai-update-streaming-progress (char-count)
   "Update mode line with streaming progress."
@@ -645,115 +808,28 @@
                  'face 'mode-line-buffer-id)))
     (force-mode-line-update)))
 
-(defun ai-stream-chunk (content stream-context)
-  "Stream CONTENT chunk to buffer."
-  (ai-debug "Stream Chunk called for: content: %s, context: %s" content stream-context)
-  (when (and content (not (string-empty-p content)) stream-context)
-    (let ((buffer (ai-stream-context-buffer stream-context))
-          (marker (ai-stream-context-response-marker stream-context)))
-      (ai-debug "Buffer: %s, Marker: %s" buffer marker)
-      (when (and buffer (buffer-live-p buffer) marker)
-        (ai-debug "Inserting content at marker position %d" (marker-position marker))
-        (with-current-buffer buffer
-          (when (string-empty-p (ai-stream-context-accumulated-text stream-context))
-            (ai-set-status 'streaming))
-          (setf (ai-stream-context-accumulated-text stream-context)
-                (concat (ai-stream-context-accumulated-text stream-context) content))
-          (save-excursion
-            (goto-char marker)
-            (insert content)
-            (set-marker marker (point)))
-          (ai-update-streaming-progress (length (ai-stream-context-accumulated-text stream-context)))
-	  (redisplay t))))))
-
-(defun ai-finish-stream (response stream-context)
-  "Finish streaming with final RESPONSE."
-  (when stream-context
-    (let ((buffer (ai-stream-context-buffer stream-context))
-          (response-marker (ai-stream-context-response-marker stream-context))
-          (accumulated-text (ai-stream-context-accumulated-text stream-context)))
-      (when (and buffer (buffer-live-p buffer))
-        (with-current-buffer buffer
-          (setq ai-current-stream nil)
-          (when (and accumulated-text (not (string-empty-p accumulated-text)))
-            (ai-add-message accumulated-text "assistant")
-            (goto-char (point-max))
-            (ai-highlight-code-blocks response-marker (point))
-            (ai-insert-prompt))
-          (ai-clear-status)
-          (message "Response complete"))))))
-
-(defun ai-handle-request-error (error stream-context)
-  "Handle request ERROR."
-  (when stream-context
-    (let ((buffer (ai-stream-context-buffer stream-context)))
-      (when (and buffer (buffer-live-p buffer))
-        (with-current-buffer buffer
-          (setq ai-current-stream nil)
-          (ai-set-status 'error)
-          (message "AI Chat Error: %s" error))))))
-
-(defun ai-make-curl-streaming-request (provider-name url headers data stream-context callback)
-  "Make streaming HTTP request using curl process."
-  (let* ((process-name (format "ai-stream-%s" (buffer-name (ai-stream-context-buffer stream-context))))
-         (buffer-name (format " *%s*" process-name))
-         (temp-file (make-temp-file "ai-request-" nil ".json"))
-         (response-buffer "")
-         (headers-processed nil)
-         (cancelled-by-user nil)
-         (process-lines-seen (make-hash-table :test 'equal)))
-    (ai-debug "CURL: %s: Starting curl process for streaming" provider-name)
-    (with-temp-file temp-file
-      (insert data))
-    (let* ((header-args (mapcar (lambda (h) (list "-H" (format "%s: %s" (car h) (cdr h)))) headers))
-           (curl-args (append '("curl" "-s" "-N" "--no-buffer" "--fail-with-body")
-                              (apply #'append header-args)
-                              (list "-X" "POST"
-                                    "-d" (format "@%s" temp-file)
-                                    url))))
-      (let ((process (apply #'start-process process-name buffer-name curl-args)))
-        (setf (ai-stream-context-request-object stream-context) process)
-        (set-process-filter
-         process
-         (lambda (proc output)
-           (unless cancelled-by-user
-             (setq response-buffer (concat response-buffer output))
-             (unless headers-processed
-               (when (string-match "\r?\n\r?\n" response-buffer)
-                 (setq response-buffer (substring response-buffer (match-end 0)))
-                 (setq headers-processed t)))
-             (when headers-processed
-               (while (string-match "\\(.*?\n\\)" response-buffer)
-                 (let ((line (match-string 1 response-buffer)))
-                   (setq response-buffer (substring response-buffer (match-end 0)))
-                   (let ((line-hash (secure-hash 'md5 line)))
-                     (unless (gethash line-hash process-lines-seen)
-                       (puthash line-hash t process-lines-seen)
-                       (ai-process-stream-line line stream-context provider-name)))))))))
-        (set-process-sentinel
-         process
-         (lambda (proc event)
-           (when (file-exists-p temp-file)
-             (delete-file temp-file))
-           (when (buffer-live-p (process-buffer proc))
-             (kill-buffer (process-buffer proc)))
-           (cond
-            ((or (string-match-p "interrupt\\|killed" (string-trim event))
-                 (and (numberp (process-exit-status proc))
-                      (not (zerop (process-exit-status proc)))))
-             (setq cancelled-by-user t)
-             (ai-cleanup-cancelled-request))
-            ((and (memq (process-status proc) '(exit signal))
-                  ai-current-stream)  ; Only if still streaming
-             (when callback
-               (funcall callback (ai-stream-context-accumulated-text stream-context)))))))
-        process))))
+(defun ai-get-curl-error-message (process exit-code)
+  "Get meaningful error message from curl process."
+  (let ((error-buffer (process-buffer process)))
+    (cond
+     ((= exit-code 7) "Failed to connect to server")
+     ((= exit-code 28) "Request timeout")
+     ((= exit-code 22) "HTTP error (check API key and endpoint)")
+     ((= exit-code 6) "Could not resolve host")
+     ((= exit-code 35) "SSL connect error")
+     ((and error-buffer (buffer-live-p error-buffer))
+      (with-current-buffer error-buffer
+        (let ((stderr-content (string-trim (buffer-string))))
+          (if (string-empty-p stderr-content)
+              (format "curl exit code: %d" exit-code)
+            stderr-content))))
+     (t (format "curl exit code: %d" exit-code)))))
 
 (defun ai-diagnose-streaming ()
   "Diagnose streaming issues."
   (interactive)
   (let ((diagnosis '())
-        (current-provider (if ai-current-session 
+        (current-provider (if ai-current-session
                              (ai-session-provider ai-current-session)
                            ai-default-provider)))
     (condition-case nil
@@ -762,25 +838,20 @@
               (push (format "✓ curl available: %s" (match-string 1 curl-version)) diagnosis)
             (push "✗ curl version not detected" diagnosis)))
       (error (push "✗ curl not found in PATH" diagnosis)))
-    
     (let ((provider (ai-get-provider current-provider)))
       (if provider
           (push (format "✓ Provider '%s' configured" current-provider) diagnosis)
         (push (format "✗ Provider '%s' not found" current-provider) diagnosis)))
-    
     (let ((api-key (ai-get-provider-api-key current-provider)))
       (if (and api-key (> (length api-key) 10))
           (push (format "✓ API key present (%d chars)" (length api-key)) diagnosis)
         (push "✗ API key missing or too short" diagnosis)))
-    
-    (let ((streaming-enabled (if ai-current-session 
-                               ai-streaming-enabled 
+    (let ((streaming-enabled (if ai-current-session
+                               ai-streaming-enabled
                              ai-streaming-default)))
       (if streaming-enabled
           (push "✓ Streaming enabled" diagnosis)
         (push "✗ Streaming disabled" diagnosis)))
-    
-    ;; Display results...
     (with-current-buffer (get-buffer-create "*AI Streaming Diagnosis*")
       (erase-buffer)
       (insert "AI Streaming Diagnosis\n")
@@ -790,25 +861,6 @@
       (insert "\nTo enable streaming: M-x ai-toggle-streaming\n")
       (insert "To enable debug: M-x ai-toggle-debug\n")
       (display-buffer (current-buffer)))))
-
-(defun ai-process-stream-line (line stream-context provider-name)
-  "Process a single line from the streaming response."
-  (ai-debug "Process Stream Line called: provider: %s :: %s" provider-name line)
-  (let ((line (string-trim line)))
-    (when (and (not (string-empty-p line))
-               (not (string-prefix-p "event:" line)))
-      (when (string-prefix-p "data:" line)
-        (let ((data-str (string-trim (substring line 5))))
-          (cond
-           ((string= data-str "[DONE]")
-            (when ai-current-stream  ; Only if still streaming
-              (ai-finish-stream nil stream-context)))
-           ((not (string-empty-p data-str))
-            (condition-case err
-                (let ((data (json-read-from-string data-str)))
-                  (ai-extract-and-stream-content data stream-context provider-name))
-              (error
-               (ai-debug "JSON parsing error: %s" err))))))))))
 
 (defun ai-extract-and-stream-content (json-data stream-context provider-name)
   "Extract content from JSON-DATA and stream it."
@@ -865,12 +917,12 @@
      (java . t)
      (sql . t))))
 
-(defun ai-create-session (&optional source-buffer provider model)
+(defun ai-create-session (&optional source-buffer provider model force-new)
   "Create a new AI chat session."
   (let* ((provider (or provider ai-default-provider))
          (model (or model (ai-get-provider-model provider)))
-         (buffer-name (if source-buffer
-                         (ai-generate-session-buffer-name source-buffer)
+         (buffer-name (if force-new
+                         (ai-generate-buffer-name provider source-buffer t)
                        (ai-generate-buffer-name provider source-buffer)))
          (buffer (get-buffer-create buffer-name))
          (session (make-ai-session
@@ -889,20 +941,16 @@
       (setq-local ai-current-status 'idle)
       (when (= (buffer-size) 0)
         (ai-insert-header session)
-        (ai-insert-prompt))  ; Only here for new sessions
+        (ai-insert-prompt))
       (ai-update-mode-line))
-    (when source-buffer
-      (with-current-buffer buffer
-        (add-hook 'kill-buffer-hook
-                  (lambda ()
-                    (ai-cleanup-session-counter (buffer-name source-buffer)))
-                  nil t)))
+    (when (and source-buffer ai-auto-associate-buffers)
+      (ai-associate-buffer-with-session source-buffer session))
     (push session ai-sessions)
     session))
 
 (defun ai-get-sessions-for-buffer (buffer)
   "Get all sessions associated with BUFFER."
-  (cl-remove-if-not 
+  (cl-remove-if-not
    (lambda (session)
      (and (buffer-live-p (ai-session-buffer session))
           (member buffer (ai-session-associated-buffers session))))
@@ -911,29 +959,26 @@
 (defun ai-select-session-for-buffer (source-buffer &optional force-new)
   "Select appropriate session for SOURCE-BUFFER.
 If FORCE-NEW is non-nil, always create new session."
-  (let ((existing-sessions (ai-get-sessions-for-buffer source-buffer)))
-    (cond
-     (force-new
-      (ai-create-session source-buffer))
-     ((null existing-sessions)
-      (ai-create-session source-buffer))
-     ((= 1 (length existing-sessions))
-      (let ((buffer-name (buffer-name source-buffer)))
-        (if (y-or-n-p (format "Use existing session for %s? " buffer-name))
-            (car existing-sessions)
-          (ai-create-session source-buffer))))
-     (t
-      (let* ((session-choices (mapcar (lambda (s) 
-                                       (cons (ai-session-name s) s)) 
-                                     existing-sessions))
-             (all-choices (append session-choices 
-                                 '(("Create new session" . new))))
-             (choice (completing-read "Select session: " all-choices)))
-        (if (eq choice 'new)
-            (ai-create-session source-buffer)
-          choice))))))
+  (if force-new
+      (ai-create-session source-buffer)
+    (let ((existing-sessions (ai-get-sessions-for-buffer source-buffer)))
+      (cond
+       ((null existing-sessions)
+        (ai-create-session source-buffer))
+       ((= 1 (length existing-sessions))
+        (car existing-sessions))
+       (t
+        (let* ((session-choices (mapcar (lambda (s)
+                                         (cons (ai-session-name s) s))
+                                       existing-sessions))
+               (all-choices (append session-choices
+                                   '(("Create new session" . new))))
+               (choice-name (completing-read "Select session: " all-choices))
+               (choice (cdr (assoc choice-name all-choices))))
+          (if (eq choice 'new)
+              (ai-create-session source-buffer)
+            choice)))))))
 
-;; Then simplify ai-select-or-create-session-for-buffer:
 (defun ai-select-or-create-session-for-buffer (&optional force-new-session)
   "Select or create session for current buffer."
   (ai-select-session-for-buffer (current-buffer) force-new-session))
@@ -1037,37 +1082,6 @@ If FORCE-NEW is non-nil, always create new session."
   "Clear current status."
   (ai-set-status 'idle))
 
-(defun ai-generate-buffer-name (&optional provider source-buffer)
-  "Generate appropriate buffer name for AI session."
-  (let* ((provider (or provider ai-default-provider))
-         (base-name (format "*AI Chat (%s)" provider))
-         (suffix (ai-get-buffer-suffix source-buffer)))
-    (if suffix
-        (format "%s - %s*" base-name suffix)
-      (format "%s*" base-name))))
-
-(defun ai-get-buffer-suffix (source-buffer)
-  "Get appropriate suffix for buffer name based on SOURCE-BUFFER."
-  (when source-buffer
-    (with-current-buffer source-buffer
-      (cond
-       ((and (featurep 'projectile) (projectile-project-p))
-        (format "%s:%s"
-                (projectile-project-name)
-                (file-name-nondirectory (buffer-name))))
-       ((and (featurep 'magit) (magit-toplevel))
-        (format "%s:%s"
-                (file-name-nondirectory (directory-file-name (magit-toplevel)))
-                (file-name-nondirectory (buffer-name))))
-       ((buffer-file-name)
-        (let ((dir (file-name-nondirectory
-                   (directory-file-name
-                    (file-name-directory (buffer-file-name))))))
-          (format "%s:%s" dir (file-name-nondirectory (buffer-name)))))
-       ((string-match "^\\*\\(.+\\)\\*$" (buffer-name))
-        (match-string 1 (buffer-name)))
-       (t (buffer-name))))))
-
 (defun ai-make-request (provider-name model messages streaming)
   "Make request to PROVIDER-NAME with MODEL and MESSAGES."
   (ai-debug "Making %s request: provider=%s, model=%s, messages=%d"
@@ -1091,7 +1105,7 @@ If FORCE-NEW is non-nil, always create new session."
 (defun ai-new-session ()
   "Create new AI chat session."
   (interactive)
-  (let ((session (ai-create-session)))
+  (let ((session (ai-create-session nil nil nil t)))
     (switch-to-buffer (ai-session-buffer session))
     (message "Started new AI chat session with %s (%s)"
              (ai-session-provider session)
@@ -1164,27 +1178,6 @@ If FORCE-NEW is non-nil, always create new session."
         (kill-process process)
       (error (ai-debug "Error killing process: %s" err))))
   (ai-cleanup-cancelled-request))
-
-(defun ai-cleanup-cancelled-request ()
-  "Clean up after request cancellation."
-  (when ai-current-stream
-    (let ((buffer (ai-stream-context-buffer ai-current-stream)))
-      (setq ai-current-stream nil)
-      (when (and buffer (buffer-live-p buffer))
-        (with-current-buffer buffer
-          (ai-set-status 'cancelled)
-          (save-excursion
-            (goto-char (point-max))
-            (when (re-search-backward "^\\*\\* Assistant Response" nil t)
-              (let ((response-start (progn (forward-line 1) (point))))
-                (when (string-empty-p (string-trim (buffer-substring response-start (point-max))))
-                  (delete-region (line-beginning-position 0) (point-max))))))
-          (run-with-timer 1.0 nil
-                         (lambda ()
-                           (when (buffer-live-p buffer)
-                             (with-current-buffer buffer
-                               (ai-clear-status)))))))))
-  (message "Request cancelled"))
 
 (defun ai-regenerate-last ()
   "Regenerate last response."
@@ -1277,7 +1270,10 @@ With prefix argument or NEW-SESSION, create a new session."
   (interactive "r\nP")
   (let* ((text (buffer-substring start end))
          (source-buffer (current-buffer))
-         (session (ai-select-or-create-session-for-buffer new-session)))
+         (session (if new-session
+                      (ai-create-session source-buffer nil nil t)  ; Pass force-new=t
+                    (or (gethash source-buffer ai-buffer-last-session-map)
+                        (ai-create-session source-buffer)))))
     (switch-to-buffer (ai-session-buffer session))
     (goto-char (point-max))
     (ai-replace-current-input text)
@@ -1296,7 +1292,10 @@ With prefix argument or NEW-SESSION, create a new session."
    (list (read-file-name "File to send: " nil nil t)
          current-prefix-arg))
   (let* ((source-buffer (current-buffer))
-         (session (ai-select-or-create-session-for-buffer new-session))
+         (session (if new-session
+		      (ai-create-session source-buffer nil nil t)
+		    (or (gethash source-buffer ai-buffer-last-session-map)
+			(ai-create-session source-buffer))))
          (content (with-temp-buffer
                    (insert-file-contents filename)
                    (buffer-string))))
@@ -1313,7 +1312,10 @@ With prefix argument or NEW-SESSION, create a new session."
   (let ((thing (ai-get-thing-at-point)))
     (if thing
         (let* ((source-buffer (current-buffer))
-               (session (ai-select-or-create-session-for-buffer new-session)))
+               (session (if new-session
+			    (ai-create-session source-buffer nil nil t)
+			  (or (gethash source-buffer ai-buffer-last-session-map)
+			      (ai-create-session source-buffer)))))
           (switch-to-buffer (ai-session-buffer session))
           (goto-char (point-max))
           (ai-replace-current-input thing)
