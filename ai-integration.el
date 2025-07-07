@@ -299,8 +299,8 @@
   (let* ((provider (or provider ai-default-provider))
          (source-name (if source-buffer
                          (buffer-name source-buffer)
-                       "*"))
-         (base-name (format "%s AI %s" source-name provider)))
+                       "ai"))
+         (base-name (format "*%s (%s) " source-name provider)))
     (if force-new
         (generate-new-buffer-name base-name)
       base-name)))
@@ -1046,24 +1046,19 @@ If FORCE-NEW is non-nil, always create new session."
   "Update mode line with current status."
   (when ai-current-session
     (let* ((status-text (cdr (assoc ai-current-status ai-status-indicators)))
-           (provider (ai-session-provider ai-current-session))
-           (source-buffer (ai-session-source-buffer ai-current-session))
-           (source-name (if source-buffer 
-                           (buffer-name source-buffer) 
-                         "*"))
-           (buffer-display-name (format "%s AI %s" source-name provider)))
+           (buffer-display-name (buffer-name (ai-session-buffer ai-current-session))))
       (setq mode-line-buffer-identification
             (list (propertize
                    (if (and chunk-count (eq ai-current-status 'streaming))
                        (let ((progress-indicator (cond
-						  ((< chunk-count 32) "▏")
-						  ((< chunk-count 64) "▎")
-						  ((< chunk-count 128) "▍")
-						  ((< chunk-count 256) "▌")
-						  ((< chunk-count 512) "▋")
-						  ((< chunk-count 1024) "▊")
-						  ((< chunk-count 2048) "▉")
-						  (t "█"))))
+                                                  ((< chunk-count 32) "▏")
+                                                  ((< chunk-count 64) "▎")
+                                                  ((< chunk-count 128) "▍")
+                                                  ((< chunk-count 256) "▌")
+                                                  ((< chunk-count 512) "▋")
+                                                  ((< chunk-count 1024) "▊")
+                                                  ((< chunk-count 2048) "▉")
+                                                  (t "█"))))
                          (format "%s %s %d chunks" buffer-display-name progress-indicator chunk-count))
                      (format "%s%s" buffer-display-name (or status-text "")))
                    'face (cond
