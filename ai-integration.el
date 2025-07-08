@@ -1,4 +1,4 @@
-;;; ai-integration.el --- AI Integration for Emacs -*- lexical-binding: t -*-
+;;; ai-integration.el --- AI Integration for Emacs -*- lexical-binding: t; indent-tabs-mode: nil; tab-width: 2 -*-
 ;; Author: Christian Bahls
 ;; Version: 0.1
 ;; Package-Requires: ((emacs "27.1") (org "9.0"))
@@ -40,6 +40,7 @@
 ;; - C-c a q      : Quick actions
 ;;
 ;; See README for complete documentation.
+
 ;;; Code:
 
 (require 'org)
@@ -298,8 +299,8 @@
   "Generate appropriate buffer name for AI session."
   (let* ((provider (or provider ai-default-provider))
          (source-name (if source-buffer
-                         (buffer-name source-buffer)
-                       "ai"))
+                          (buffer-name source-buffer)
+                        "ai"))
          (base-name (format "*%s (%s) " source-name provider)))
     (if force-new
         (generate-new-buffer-name base-name)
@@ -491,13 +492,13 @@
   "Generate request data for Gemini API."
   (let ((contents (mapcar (lambda (msg)
                             `((role . ,(if (string= (plist-get msg :role) "assistant")
-                                          "model"
-                                        (plist-get msg :role)))
+                                           "model"
+                                         (plist-get msg :role)))
                               (parts . [((text . ,(plist-get msg :content)))])))
                           messages)))
     (json-encode `((contents . ,contents)
                    (generationConfig . ((temperature . 0.7)
-                                       (maxOutputTokens . 4096)))))))
+                                        (maxOutputTokens . 4096)))))))
 
 (defun ai-get-gemini-endpoint (model)
   "Get Gemini endpoint with MODEL inserted."
@@ -586,78 +587,199 @@
       (ai-set-status 'requesting))
     (ai-make-curl-request provider-name endpoint headers data stream-context streaming)))
 
+
+
 (defun ai-make-curl-request (provider-name url headers data stream-context streaming)
-  "Make HTTP request using curl process."
+  "Make HTTP request using curl process with robust error handling."
   (let* ((target-buffer (ai-stream-context-buffer stream-context))
          (process-name (format "ai-request-%s" (buffer-name target-buffer)))
          (buffer-name (format " *%s*" process-name))
          (temp-file (make-temp-file "ai-request-" nil ".json"))
          (response-buffer "")
-         (headers-processed nil))
+         (headers-processed nil)
+         (stderr-buffer (generate-new-buffer (format " *%s-stderr*" process-name))))
+
     (ai-debug "CURL: %s: Starting curl process (%s)" provider-name (if streaming "streaming" "non-streaming"))
-    (with-temp-file temp-file
-      (insert data))
+
+    ;; Validate curl availability early
+    (unless (executable-find "curl")
+      (ai-handle-request-error "curl command not found in PATH" stream-context)
+      (return))
+
+    ;; Write data to temp file with error handling
+    (condition-case err
+        (with-temp-file temp-file
+          (insert data))
+      (error
+       (ai-handle-request-error (format "Failed to write request data: %s" (error-message-string err)) stream-context)
+       (return)))
+
     (let* ((header-args (mapcar (lambda (h) (list "-H" (format "%s: %s" (car h) (cdr h)))) headers))
-           (curl-args (append '("curl" "-s" "--show-error")
+           (curl-args (append '("curl" "-s" "--show-error" "--fail-with-body")
                               (when streaming '("-N" "--no-buffer"))
                               (list "--max-time" (number-to-string ai-request-timeout)
-                                    ;; Add this flag to include response headers
-                                    "-i")
+                                    "--connect-timeout" "30"
+                                    "-i")  ; Include response headers
                               (apply #'append header-args)
                               (list "-X" "POST"
                                     "-d" (format "@%s" temp-file)
                                     url))))
+
       (ai-debug "CURL: %S" curl-args)
       (ai-debug "HEADER: %S" header-args)
       (ai-debug "TEMP FILE: %S" temp-file)
+
       (with-temp-buffer
-	(insert-file-contents temp-file)
-	(ai-debug (buffer-string)))
-      (let ((process (apply #'start-process process-name buffer-name curl-args)))
-        (setf (ai-stream-context-request-object stream-context) process)
-        (set-process-filter
-         process
-         (lambda (proc output)
-           (setq response-buffer (concat response-buffer output))
-           (unless headers-processed
-             (when (string-match "\r?\n\r?\n" response-buffer)
-               (setq response-buffer (substring response-buffer (match-end 0)))
-               (setq headers-processed t)))
-           (when headers-processed
-             (if streaming
-                 ;; Streaming: process line by line
-		 (while (string-match "\\(.*?\n\\)" response-buffer)
-		   (let ((line (match-string 1 response-buffer)))
-		     (setq response-buffer (substring response-buffer (match-end 0)))
-		     (ai-process-response line stream-context provider-name t)))
-               ;; Non-streaming: accumulate all response
-               (setf (ai-stream-context-accumulated-text stream-context) response-buffer)))))
-        (set-process-sentinel
-         process
-         (lambda (proc event)
-           (when (file-exists-p temp-file)
-             (delete-file temp-file))
-           (when (buffer-live-p (process-buffer proc))
-             (kill-buffer (process-buffer proc)))
-           (let ((exit-code (process-exit-status proc))
-                 (exit-signal (process-status proc)))
-             (cond
-              ((zerop exit-code)
-               (when (not streaming)
-                 ;; Process the complete response
-                 (let ((response-data (ai-stream-context-accumulated-text stream-context)))
-                   (ai-debug "Non-streaming response data: %s" (substring response-data 0 (min 200 (length response-data))))
-                   (ai-process-response response-data stream-context provider-name nil)))
-               (ai-finalize-response stream-context))
-              ((memq exit-signal '(signal interrupt))
-               (ai-handle-request-cancellation stream-context))
-              (t
-               (let ((error-msg (ai-get-curl-error-message proc exit-code)))
-                 (ai-handle-request-error error-msg stream-context)))))))
-        process))))
+        (insert-file-contents temp-file)
+        (ai-debug "Request data: %s" (buffer-string)))
+
+      (condition-case err
+          (let ((process (make-process
+                          :name process-name
+                          :buffer buffer-name
+                          :stderr stderr-buffer
+                          :command curl-args
+                          :connection-type 'pipe)))
+
+            (setf (ai-stream-context-request-object stream-context) process)
+
+            (set-process-filter
+             process
+             (lambda (proc output)
+               (condition-case filter-err
+                   (progn
+                     (setq response-buffer (concat response-buffer output))
+                     (unless headers-processed
+                       (when (string-match "\r?\n\r?\n" response-buffer)
+                         (let ((headers-section (substring response-buffer 0 (match-beginning 0))))
+                           (ai-debug "Response headers: %s" headers-section)
+                           ;; Check for HTTP error status in headers
+                           (when (string-match "HTTP/[0-9.]+ \\([45][0-9][0-9]\\)" headers-section)
+                             (let ((status-code (match-string 1 headers-section)))
+                               (ai-debug "HTTP error status detected: %s" status-code)
+                               ;; Don't return early - let the process complete to get full error message
+                               )))
+                         (setq response-buffer (substring response-buffer (match-end 0)))
+                         (setq headers-processed t)))
+                     (when headers-processed
+                       (if streaming
+                           ;; Streaming: process line by line
+                           (while (string-match "\\(.*?\n\\)" response-buffer)
+                             (let ((line (match-string 1 response-buffer)))
+                               (setq response-buffer (substring response-buffer (match-end 0)))
+                               (ai-process-response line stream-context provider-name t)))
+                         ;; Non-streaming: accumulate all response
+                         (setf (ai-stream-context-accumulated-text stream-context) response-buffer))))
+                 (error
+                  (ai-debug "Error in process filter: %s" filter-err)
+                  (ai-handle-request-error (format "Process filter error: %s" (error-message-string filter-err)) stream-context)))))
+
+            (set-process-sentinel
+             process
+             (lambda (proc event)
+               (ai-debug "Process sentinel called: %s with event: %s" proc (string-trim event))
+
+               ;; Clean up temp file
+               (when (file-exists-p temp-file)
+                 (condition-case nil (delete-file temp-file) (error nil)))
+
+               ;; Get stderr content for better error messages
+               (let ((stderr-content "")
+                     (exit-code (process-exit-status proc))
+                     (exit-signal (process-status proc)))
+
+                 (when (buffer-live-p stderr-buffer)
+                   (with-current-buffer stderr-buffer
+                     (setq stderr-content (string-trim (buffer-string))))
+                   (kill-buffer stderr-buffer))
+
+                 (when (buffer-live-p (process-buffer proc))
+                   (kill-buffer (process-buffer proc)))
+
+                 (ai-debug "Process exit: code=%s, signal=%s, stderr=%s" exit-code exit-signal stderr-content)
+
+                 (cond
+                  ((zerop exit-code)
+                   (when (not streaming)
+                     ;; Process the complete response
+                     (let ((response-data (ai-stream-context-accumulated-text stream-context)))
+                       (ai-debug "Non-streaming response data: %s" (substring response-data 0 (min 200 (length response-data))))
+                       (if (string-empty-p response-data)
+                           (ai-handle-request-error "Empty response from server" stream-context)
+                         (ai-process-response response-data stream-context provider-name nil))))
+                   (ai-finalize-response stream-context))
+
+                  ((memq exit-signal '(signal interrupt))
+                   (ai-handle-request-cancellation stream-context))
+
+                  (t
+                   ;; Enhanced error message combining exit code, stderr, and response
+                   (let ((error-msg (ai-get-enhanced-curl-error-message proc exit-code stderr-content
+                                                                        (ai-stream-context-accumulated-text stream-context))))
+                     (ai-debug "Curl error: %s" error-msg)
+                     (ai-handle-request-error error-msg stream-context)))))))
+
+            process)
+
+        (error
+         (ai-debug "Failed to start curl process: %s" err)
+         (when (file-exists-p temp-file)
+           (condition-case nil (delete-file temp-file) (error nil)))
+         (when (buffer-live-p stderr-buffer)
+           (kill-buffer stderr-buffer))
+         (ai-handle-request-error (format "Failed to start curl process: %s" (error-message-string err)) stream-context)
+         nil)))))
+
+;; Enhanced error message function:
+
+(defun ai-get-enhanced-curl-error-message (process exit-code stderr-content response-content)
+  "Get comprehensive error message from curl process."
+  (let ((base-error (cond
+                     ((= exit-code 6) "Could not resolve host - check your internet connection")
+                     ((= exit-code 7) "Failed to connect to server - server may be down or URL incorrect")
+                     ((= exit-code 22) "HTTP error - check API key, endpoint, and request format")
+                     ((= exit-code 28) "Request timeout - server took too long to respond")
+                     ((= exit-code 35) "SSL connection error - check server certificates")
+                     ((= exit-code 52) "Server returned empty response")
+                     ((= exit-code 56) "Network receive error")
+                     (t (format "curl exit code: %d" exit-code))))
+        (additional-info '()))
+
+    ;; Add stderr content if meaningful
+    (when (and stderr-content (not (string-empty-p stderr-content))
+               (not (string-match-p "^curl:" stderr-content))) ; Avoid duplicating curl prefix
+      (push stderr-content additional-info))
+
+    ;; Add response content if it looks like an error message
+    (when (and response-content (not (string-empty-p response-content)))
+      (condition-case nil
+          (let ((json-data (json-read-from-string response-content)))
+            (cond
+             ;; Try common error formats
+             ((assoc 'error json-data)
+              (let ((error-obj (cdr (assoc 'error json-data))))
+                (cond
+                 ((stringp error-obj) (push error-obj additional-info))
+                 ((and (listp error-obj) (assoc 'message error-obj))
+                  (push (cdr (assoc 'message error-obj)) additional-info)))))
+             ((assoc 'message json-data)
+              (push (cdr (assoc 'message json-data)) additional-info))))
+        (error
+         ;; If not JSON, include raw response if it's short and looks like an error
+         (when (and (< (length response-content) 200)
+                    (or (string-match-p "error\\|Error\\|ERROR" response-content)
+                        (string-match-p "unauthorized\\|forbidden\\|not found" response-content)))
+           (push (string-trim response-content) additional-info)))))
+
+    ;; Combine all information
+    (if additional-info
+        (format "%s: %s" base-error (string-join additional-info "; "))
+      base-error)))
+
+;; Enhanced ai-process-response with better error handling:
 
 (defun ai-process-response (response-data stream-context provider-name is-streaming)
-  "Process response data (streaming chunk or bulk response)."
+  "Process response data (streaming chunk or bulk response) with robust error handling."
   (if is-streaming
       ;; Streaming: process as SSE line
       (ai-process-stream-line response-data stream-context provider-name)
@@ -666,22 +788,59 @@
         (let* ((provider (ai-get-provider provider-name))
                ;; Clean up the response data before parsing
                (cleaned-data (string-trim response-data))
-               (json-data (progn
-                            (ai-debug "Parsing JSON data: %s" (substring cleaned-data 0 (min 500 (length cleaned-data))))
-                            (json-read-from-string cleaned-data)))
-               (error-msg (when (ai-provider-error-parser provider)
-                            (funcall (ai-provider-error-parser provider) json-data))))
+               json-data error-msg response)
+
+          ;; Validate we have a provider (robust against missing providers)
+          (unless provider
+            (ai-handle-request-error (format "Provider '%s' not found or not configured properly" provider-name) stream-context)
+            (return))
+
+          ;; Parse JSON with better error reporting
+          (condition-case json-err
+              (progn
+                (ai-debug "Parsing JSON data: %s" (substring cleaned-data 0 (min 500 (length cleaned-data))))
+                (setq json-data (json-read-from-string cleaned-data)))
+            (error
+             (ai-debug "JSON parsing failed. Raw data: %s" cleaned-data)
+             (ai-handle-request-error (format "Invalid JSON response: %s\nRaw response: %s"
+                                              (error-message-string json-err)
+                                              (substring cleaned-data 0 (min 200 (length cleaned-data))))
+                                      stream-context)
+             (return)))
+
+          ;; Check for API errors using provider error parser (if available)
+          (when (and (ai-provider-error-parser provider) json-data)
+            (condition-case parser-err
+                (setq error-msg (funcall (ai-provider-error-parser provider) json-data))
+              (error
+               (ai-debug "Error parser failed: %s" parser-err)
+               ;; Continue without provider-specific error parsing
+               (setq error-msg nil))))
+
           (if error-msg
               (ai-handle-request-error error-msg stream-context)
-            (let ((response (funcall (ai-provider-response-parser provider) json-data)))
-              (ai-debug "Extracted response: %s" (substring response 0 (min 100 (length response))))
-              (ai-stream-chunk response stream-context))))
-      (error
-       (ai-debug "JSON parsing failed. Raw data: %s" response-data)
-       (ai-handle-request-error (format "JSON parsing error: %s\nRaw response: %s" 
-                                        (error-message-string err) 
-                                        (substring response-data 0 (min 200 (length response-data)))) 
-                                stream-context)))))
+            ;; Extract response using provider parser (if available)
+            (condition-case parser-err
+                (if (ai-provider-response-parser provider)
+                    (setq response (funcall (ai-provider-response-parser provider) json-data))
+                  ;; Fallback if no response parser
+                  (setq response (or (cdr (assoc 'content json-data))
+                                     (cdr (assoc 'text json-data))
+                                     (cdr (assoc 'message json-data))
+                                     (format "Received response but no parser available for provider '%s'" provider-name))))
+              (error
+               (ai-debug "Response parser failed: %s" parser-err)
+               ;; Use fallback parsing
+               (setq response (or (cdr (assoc 'content json-data))
+                                  (cdr (assoc 'text json-data))
+                                  (cdr (assoc 'message json-data))
+                                  "Response parser failed - check provider configuration"))))
+
+            (ai-debug "Extracted response: %s" (substring response 0 (min 100 (length response))))
+            (ai-stream-chunk response stream-context))))
+    (error
+     (ai-debug "Unexpected error in process-response: %s" err)
+     (ai-handle-request-error (format "Response processing error: %s" (error-message-string err)) stream-context))))
 
 (defun ai-stream-chunk (content stream-context)
   "Stream CONTENT chunk to buffer."
@@ -737,23 +896,34 @@
                 (if error-msg
                     (ai-handle-request-error error-msg stream-context)
                   (ai-extract-and-stream-content data stream-context provider-name)))
-	    (error
-	     (ai-debug "JSON parsing error: %s" err))))))))
+            (error
+             (ai-debug "JSON parsing error: %s" err))))))))
 
 (defun ai-handle-request-error (error stream-context)
-  "Handle request ERROR."
+  "Handle request ERROR with enhanced UI feedback."
   (when (and stream-context (ai-stream-context-buffer stream-context))
     (let ((buffer (ai-stream-context-buffer stream-context)))
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
           (setq ai-current-stream nil)
           (ai-set-status 'error)
+
+          ;; Insert error message in the chat buffer
+          (save-excursion
+            (goto-char (point-max))
+            (unless (bolp) (insert "\n"))
+            (insert (format "\n** Error\n%s\n" error)))
+
+          ;; Show error in messages and mode line
           (message "AI Chat Error: %s" error)
-          (run-with-timer 3.0 nil
-                         (lambda ()
-                           (when (buffer-live-p buffer)
-                             (with-current-buffer buffer
-                               (ai-clear-status))))))))))
+          (ai-debug "Request error: %s" error)
+
+          ;; Clear error status after delay
+          (run-with-timer 5.0 nil
+                          (lambda ()
+                            (when (buffer-live-p buffer)
+                              (with-current-buffer buffer
+                                (ai-clear-status))))))))))
 
 (defun ai-handle-request-cancellation (stream-context)
   "Handle request cancellation."
@@ -764,10 +934,10 @@
           (setq ai-current-stream nil)
           (ai-set-status 'cancelled)
           (run-with-timer 2.0 nil
-                         (lambda ()
-                           (when (buffer-live-p buffer)
-                             (with-current-buffer buffer
-                               (ai-clear-status)))))
+                          (lambda ()
+                            (when (buffer-live-p buffer)
+                              (with-current-buffer buffer
+                                (ai-clear-status)))))
           (message "Request cancelled"))))))
 
 (defun ai-cleanup-cancelled-request ()
@@ -785,10 +955,10 @@
                 (when (string-empty-p (string-trim (buffer-substring response-start (point-max))))
                   (delete-region (line-beginning-position 0) (point-max))))))
           (run-with-timer 1.0 nil
-                         (lambda ()
-                           (when (buffer-live-p buffer)
-                             (with-current-buffer buffer
-                               (ai-clear-status)))))))))
+                          (lambda ()
+                            (when (buffer-live-p buffer)
+                              (with-current-buffer buffer
+                                (ai-clear-status)))))))))
   (message "Request cancelled"))
 
 (defun ai-get-curl-error-message (process exit-code)
@@ -813,8 +983,8 @@
   (interactive)
   (let ((diagnosis '())
         (current-provider (if ai-current-session
-                             (ai-session-provider ai-current-session)
-                           ai-default-provider)))
+                              (ai-session-provider ai-current-session)
+                            ai-default-provider)))
     (condition-case nil
         (let ((curl-version (shell-command-to-string "curl --version")))
           (if (string-match "curl \\([0-9]+\\.[0-9]+\\)" curl-version)
@@ -830,8 +1000,8 @@
           (push (format "✓ API key present (%d chars)" (length api-key)) diagnosis)
         (push "✗ API key missing or too short" diagnosis)))
     (let ((streaming-enabled (if ai-current-session
-                               ai-streaming-enabled
-                             ai-streaming-default)))
+                                 ai-streaming-enabled
+                               ai-streaming-default)))
       (if streaming-enabled
           (push "✓ Streaming enabled" diagnosis)
         (push "✗ Streaming disabled" diagnosis)))
@@ -905,8 +1075,8 @@
   (let* ((provider (or provider ai-default-provider))
          (model (or model (ai-get-provider-model provider)))
          (buffer-name (if force-new
-                         (ai-generate-buffer-name provider source-buffer t)
-                       (ai-generate-buffer-name provider source-buffer)))
+                          (ai-generate-buffer-name provider source-buffer t)
+                        (ai-generate-buffer-name provider source-buffer)))
          (buffer (get-buffer-create buffer-name))
          (session (make-ai-session
                    :name buffer-name
@@ -952,10 +1122,10 @@ If FORCE-NEW is non-nil, always create new session."
         (car existing-sessions))
        (t
         (let* ((session-choices (mapcar (lambda (s)
-                                         (cons (ai-session-name s) s))
-                                       existing-sessions))
+                                          (cons (ai-session-name s) s))
+                                        existing-sessions))
                (all-choices (append session-choices
-                                   '(("Create new session" . new))))
+                                    '(("Create new session" . new))))
                (choice-name (completing-read "Select session: " all-choices))
                (choice (cdr (assoc choice-name all-choices))))
           (if (eq choice 'new)
@@ -1196,13 +1366,13 @@ If FORCE-NEW is non-nil, always create new session."
    (let* ((providers (hash-table-keys ai-providers))
           (new-provider (completing-read "Provider: " providers nil t))
           (new-model (when current-prefix-arg
-                      (read-string "Model (leave empty for default): "))))
+                       (read-string "Model (leave empty for default): "))))
      (list new-provider new-model)))
   (unless ai-current-session
     (error "No active session"))
   (let* ((new-provider (or provider
-                          (completing-read "Provider: "
-                                         (hash-table-keys ai-providers) nil t)))
+                           (completing-read "Provider: "
+                                            (hash-table-keys ai-providers) nil t)))
          (new-model (or model (ai-get-provider-model new-provider))))
     (ai-debug "Switching provider: %s (%s) -> %s (%s)"
               (ai-session-provider ai-current-session)
@@ -1285,12 +1455,12 @@ With prefix argument or NEW-SESSION, create a new session."
          current-prefix-arg))
   (let* ((source-buffer (current-buffer))
          (session (if new-session
-		      (ai-create-session source-buffer nil nil t)
-		    (or (gethash source-buffer ai-buffer-last-session-map)
-			(ai-create-session source-buffer))))
+                      (ai-create-session source-buffer nil nil t)
+                    (or (gethash source-buffer ai-buffer-last-session-map)
+                        (ai-create-session source-buffer))))
          (content (with-temp-buffer
-                   (insert-file-contents filename)
-                   (buffer-string))))
+                    (insert-file-contents filename)
+                    (buffer-string))))
     (switch-to-buffer (ai-session-buffer session))
     (goto-char (point-max))
     (ai-replace-current-input
@@ -1305,9 +1475,9 @@ With prefix argument or NEW-SESSION, create a new session."
     (if thing
         (let* ((source-buffer (current-buffer))
                (session (if new-session
-			    (ai-create-session source-buffer nil nil t)
-			  (or (gethash source-buffer ai-buffer-last-session-map)
-			      (ai-create-session source-buffer)))))
+                            (ai-create-session source-buffer nil nil t)
+                          (or (gethash source-buffer ai-buffer-last-session-map)
+                              (ai-create-session source-buffer)))))
           (switch-to-buffer (ai-session-buffer session))
           (goto-char (point-max))
           (ai-replace-current-input thing)
@@ -1349,10 +1519,10 @@ With prefix argument or NEW-SESSION, create a new session."
   (unless ai-current-session
     (error "No active session"))
   (let ((filename (or filename
-                     (expand-file-name
-                      (format "session-%s.json"
-                              (format-time-string "%Y%m%d-%H%M%S"))
-                      ai-conversation-directory))))
+                      (expand-file-name
+                       (format "session-%s.json"
+                               (format-time-string "%Y%m%d-%H%M%S"))
+                       ai-conversation-directory))))
     (unless (file-exists-p ai-conversation-directory)
       (make-directory ai-conversation-directory t))
     (with-temp-file filename
@@ -1528,14 +1698,14 @@ With prefix argument or NEW-SESSION, create a new session."
                  ,(format "Apply %s to thing at point." base-name)
                  (interactive)
                  (let ((thing (if ,is-code
-                                 (or (thing-at-point 'defun)
-                                     (thing-at-point 'symbol))
-                               (ai-get-thing-at-point))))
+                                  (or (thing-at-point 'defun)
+                                      (thing-at-point 'symbol))
+                                (ai-get-thing-at-point))))
                    (if thing
                        (let ((mode-name (if ,is-code
-                                           (replace-regexp-in-string "-mode$" ""
-                                                                    (symbol-name major-mode))
-                                         "")))
+                                            (replace-regexp-in-string "-mode$" ""
+                                                                      (symbol-name major-mode))
+                                          "")))
                          (ai-with-template
                           (if ,is-code
                               (format ,template mode-name thing)
@@ -1545,16 +1715,16 @@ With prefix argument or NEW-SESSION, create a new session."
                  ,(format "Apply %s to file." base-name)
                  (interactive "fFile: ")
                  (let ((content (with-temp-buffer
-                                 (insert-file-contents filename)
-                                 (buffer-string)))
+                                  (insert-file-contents filename)
+                                  (buffer-string)))
                        (mode-name (if ,is-code
-                                     (let ((mode (assoc-default filename auto-mode-alist
-                                                               'string-match)))
-                                       (if mode
-                                           (replace-regexp-in-string "-mode$" ""
-                                                                    (symbol-name mode))
-                                         "text"))
-                                   "")))
+                                      (let ((mode (assoc-default filename auto-mode-alist
+                                                                 'string-match)))
+                                        (if mode
+                                            (replace-regexp-in-string "-mode$" ""
+                                                                      (symbol-name mode))
+                                          "text"))
+                                    "")))
                    (ai-with-template
                     (concat
                      (format "File: %s\n\n" filename)
@@ -1817,7 +1987,7 @@ With prefix argument or NEW-SESSION, create a new session."
   (let* ((prompt-keys (mapcar #'car ai-system-prompts))
          (selected (completing-read "System prompt: " prompt-keys nil nil))
          (prompt (or (cdr (assoc selected ai-system-prompts))
-                    (read-string "Custom system prompt: "))))
+                     (read-string "Custom system prompt: "))))
     (let ((messages (ai-session-messages ai-current-session)))
       (unless (and messages (string= (plist-get (car (last messages)) :role) "system"))
         (setf (ai-session-messages ai-current-session)
@@ -1828,19 +1998,19 @@ With prefix argument or NEW-SESSION, create a new session."
   "Perform quick AI action."
   (interactive
    (list (completing-read "Quick action: "
-                         '("Explain error"
-                           "Generate test"
-                           "Add documentation"
-                           "Improve naming"
-                           "Extract function"
-                           "Add type hints"
-                           "Generate docstring"
-                           "Find bugs"
-                           "Optimize performance"
-                           "Add error handling"))))
+                          '("Explain error"
+                            "Generate test"
+                            "Add documentation"
+                            "Improve naming"
+                            "Extract function"
+                            "Add type hints"
+                            "Generate docstring"
+                            "Find bugs"
+                            "Optimize performance"
+                            "Add error handling"))))
   (let ((region-text (if (use-region-p)
-                        (buffer-substring-no-properties (region-beginning) (region-end))
-                      (thing-at-point 'defun))))
+                         (buffer-substring-no-properties (region-beginning) (region-end))
+                       (thing-at-point 'defun))))
     (unless region-text
       (error "No code selected"))
     (ai-with-template
