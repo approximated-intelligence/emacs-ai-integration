@@ -1392,6 +1392,11 @@ If FORCE-NEW is non-nil, always create new session."
   (interactive)
   (ai-change-provider "claude"))
 
+(defun ai-switch-to-ollama ()
+  "Switch to ollama."
+  (interactive)
+  (ai-change-provider "ollama"))
+
 (defun ai-switch-to-gemini ()
   "Switch to Gemini."
   (interactive)
@@ -1645,9 +1650,10 @@ With prefix argument or NEW-SESSION, create a new session."
     (define-key map (kbd "x") 'ai-clear-session)
     (define-key map (kbd "k") 'ai-cancel-request)
     (define-key map (kbd "P") 'ai-change-provider)
-    (define-key map (kbd "O") 'ai-switch-to-openai)
+    (define-key map (kbd "I") 'ai-switch-to-openai)
     (define-key map (kbd "C") 'ai-switch-to-claude)
     (define-key map (kbd "G") 'ai-switch-to-gemini)
+    (define-key map (kbd "O") 'ai-switch-to-ollama)
     (define-key map (kbd "r") 'ai-send-region)
     (define-key map (kbd "b") 'ai-send-buffer)
     (define-key map (kbd "i") 'ai-insert-response)
