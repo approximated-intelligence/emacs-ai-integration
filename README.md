@@ -51,9 +51,6 @@ export GEMINI_API_KEY="your-gemini-key-here"
 (setq ai-openai-model "gpt-4o")
 (setq ai-claude-model "claude-sonnet-4-20250514")
 (setq ai-gemini-model "gemini-1.5-flash")
-
-;; Optional: Enable minor mode globally
-(global-ai-minor-mode 1)
 ```
 
 ### Local AI Providers
